@@ -1,0 +1,4 @@
+listen_address: ":8080"
+backends:
+  - url: "http://localhost:8081"  # Your first running REST API
+strategy: "round_robin"
