@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"high-performance-proxy/internal/config"
+	"high-performance-proxy/internal/pool"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -22,8 +23,8 @@ func main() {
 		return
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(backendURL)	
-
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	proxy.Transport = pool.NewTransport()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Hello World")
