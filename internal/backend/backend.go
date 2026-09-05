@@ -22,4 +22,3 @@ func (b *Backend) IsHealthy() bool {
 func (b *Backend) SetHealthy(healthy bool) {
 	b.Healthy.Store(healthy)
 }
-

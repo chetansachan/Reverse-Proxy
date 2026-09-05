@@ -29,6 +29,8 @@ func (r *RoundRobin) NextBackend() *backend.Backend {
 
 		if b.Healthy.Load() {
 			return b
+		} else {
+			continue
 		}
 	}
 
