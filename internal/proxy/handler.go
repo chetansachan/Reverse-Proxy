@@ -16,24 +16,16 @@ func NewProxyHandler(b balancer.Balancer, tr *http.Transport) *ProxyHandler {
 	h := &ProxyHandler{
 		Transport: tr,
 	}
-	if b != nil {
-		h.CurrentBalancer.Store(b)
-	}
+	h.CurrentBalancer.Store(b)
 	return h
 }
 
 func (h *ProxyHandler) SetBalancer(b balancer.Balancer) {
-	if b != nil {
-		h.CurrentBalancer.Store(b)
-	}
+	h.CurrentBalancer.Store(b)
 }
 
 func (h *ProxyHandler) GetBalancer() balancer.Balancer {
-	val := h.CurrentBalancer.Load()
-	if val == nil {
-		return nil
-	}
-	if b, ok := val.(balancer.Balancer); ok {
+	if b, ok := h.CurrentBalancer.Load().(balancer.Balancer); ok {
 		return b
 	}
 	return nil
@@ -58,4 +50,3 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.Transport = h.Transport
 	proxy.ServeHTTP(w, r)
 }
-
