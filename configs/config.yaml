@@ -8,4 +8,19 @@ backends:
   - "http://127.0.0.1:8086"
   - "http://127.0.0.1:8087"
   - "http://127.0.0.1:8088"
-strategy: "round_robin"
+strategy: "round_robin" # Options: round_robin, least_conn, ip_hash
+
+health_check:
+  interval: "5s"
+  timeout: "2s"
+  path: "/health"
+
+timeouts:
+  read_timeout: "15s"
+  read_header_timeout: "5s"
+  write_timeout: "15s"
+  idle_timeout: "60s"
+
+retry:
+  max_retries: 2
+  passive_failure_threshold: 3

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"high-performance-proxy/internal/backend"
 	"high-performance-proxy/internal/balancer"
@@ -9,7 +10,8 @@ import (
 	"high-performance-proxy/internal/health"
 	"high-performance-proxy/internal/pool"
 	"high-performance-proxy/internal/proxy"
-	"log"
+	"high-performance-proxy/pkg/logger"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os/signal"
@@ -23,27 +25,78 @@ var (
 	healthMu     sync.Mutex
 )
 
+type BackendStatus struct {
+	URL           string `json:"url"`
+	Healthy       bool   `json:"healthy"`
+	ActiveConns   int32  `json:"active_conns"`
+	Failures      int32  `json:"consecutive_failures"`
+	TotalRequests uint64 `json:"total_requests"`
+}
+
+type StatusResponse struct {
+	Strategy string          `json:"strategy"`
+	Backends []BackendStatus `json:"backends"`
+}
+
 func main() {
 	cfg, err := config.LoadConfig("configs/config.yaml")
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		logger.Error("Failed to load initial config", slog.Any("error", err))
+		return
 	}
+
+	logger.Info("Starting High-Performance Reverse Proxy",
+		slog.String("listen_address", cfg.Port),
+		slog.String("strategy", cfg.Strategy),
+		slog.Int("backends_count", len(cfg.Backends)),
+	)
 
 	// Listen for Ctrl+C / termination signals
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	proxyHandler := proxy.NewProxyHandler(nil, pool.NewTransport())
+	tr := pool.NewTransport()
+	bp := pool.NewBufferPool()
+	passive := health.NewPassiveChecker(cfg.Retry.PassiveFailureThreshold)
+	proxyHandler := proxy.NewProxyHandler(nil, tr, bp, passive, cfg.Retry.MaxRetries)
 
 	// Initial configuration load
 	if err := reloadConfig(proxyHandler, ctx); err != nil {
-		log.Fatalf("failed to initialize config: %v", err)
+		logger.Error("Failed to initialize backends and balancer", slog.Any("error", err))
+		return
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hello World")
+		fmt.Fprintln(w, "Hello World from Proxy")
 	})
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		currentBalancer := proxyHandler.GetBalancer()
+		if currentBalancer == nil {
+			http.Error(w, `{"error": "no active balancer"}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		backends := currentBalancer.GetBackends()
+		statusList := make([]BackendStatus, 0, len(backends))
+		for _, b := range backends {
+			statusList = append(statusList, BackendStatus{
+				URL:           b.URL.String(),
+				Healthy:       b.IsHealthy(),
+				ActiveConns:   b.GetActiveConns(),
+				Failures:      b.GetFailures(),
+				TotalRequests: b.GetTotalRequests(),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(StatusResponse{
+			Strategy: cfg.Strategy,
+			Backends: statusList,
+		})
+	})
+
 	mux.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
 		if err := reloadConfig(proxyHandler, ctx); err != nil {
 			http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
@@ -51,24 +104,29 @@ func main() {
 		}
 		fmt.Fprintln(w, "Config reloaded successfully")
 	})
+
 	mux.Handle("/", proxyHandler)
 
 	srv := &http.Server{
-		Addr:    cfg.Port,
-		Handler: mux,
+		Addr:              cfg.Port,
+		Handler:           logger.HTTPMiddleware(mux),
+		ReadTimeout:       cfg.Timeouts.ReadTimeout,
+		ReadHeaderTimeout: cfg.Timeouts.ReadHeaderTimeout,
+		WriteTimeout:      cfg.Timeouts.WriteTimeout,
+		IdleTimeout:       cfg.Timeouts.IdleTimeout,
 	}
 
 	// Run the server in a goroutine
 	go func() {
-		log.Printf("Server is running on port %s...\n", cfg.Port)
+		logger.Info("Proxy server listening", slog.String("addr", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			logger.Error("Server encountered fatal error", slog.Any("error", err))
 		}
 	}()
 
-	// Block here until we get the signal
+	// Block here until we receive SIGINT/SIGTERM
 	<-ctx.Done()
-	log.Println("Shutting down gracefully...")
+	logger.Info("Shutting down gracefully...")
 
 	// Stop health checker
 	healthMu.Lock()
@@ -77,43 +135,43 @@ func main() {
 	}
 	healthMu.Unlock()
 
-	// Give active requests 30 seconds to finish
+	// Give active requests up to 30 seconds to finish
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// This blocks until all requests finish or timeout
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Shutdown forced: %v", err)
+		logger.Error("Shutdown forced due to error", slog.Any("error", err))
+		return
 	}
-	log.Println("Server exited cleanly")
+	logger.Info("Server exited cleanly")
 }
 
 func reloadConfig(proxyHandler *proxy.ProxyHandler, parentCtx context.Context) error {
 	// 1. Parse the new config.yaml
 	cfg, err := config.LoadConfig("configs/config.yaml")
 	if err != nil {
-		log.Printf("failed to reload config: %v", err)
+		logger.Error("Failed to reload config file", slog.Any("error", err))
 		return err
 	}
 
-	// 2. Create a brand new list of Backends and a brand new Balancer
+	// 2. Create Backends with pre-allocated ReverseProxy instances
 	var newBackends []*backend.Backend
 	for _, rawURL := range cfg.Backends {
 		u, err := url.Parse(rawURL)
 		if err != nil {
-			log.Printf("failed to parse backend URL %s: %v", rawURL, err)
+			logger.Error("Failed to parse backend URL", slog.String("url", rawURL), slog.Any("error", err))
 			return err
 		}
-		b := &backend.Backend{
-			URL: u,
-		}
-		b.SetHealthy(true)
+
+		backendProxy := proxyHandler.BuildReverseProxy(u)
+		b := backend.NewBackend(u, backendProxy)
 		newBackends = append(newBackends, b)
 	}
 
-	newBalancer := balancer.NewRoundRobin(newBackends)
+	// 3. Instantiate the configured load balancer strategy
+	newBalancer := balancer.NewBalancer(cfg.Strategy, newBackends)
 
-	// 3. Stop old HealthChecker (if any) and start a new HealthChecker
+	// 4. Stop old HealthChecker (if any) and start the new HealthChecker
 	healthMu.Lock()
 	if healthCancel != nil {
 		healthCancel()
@@ -122,11 +180,19 @@ func reloadConfig(proxyHandler *proxy.ProxyHandler, parentCtx context.Context) e
 	healthCancel = cancel
 	healthMu.Unlock()
 
-	newHealthChecker := health.NewHealthChecker(newBackends)
+	newHealthChecker := health.NewHealthChecker(
+		newBackends,
+		cfg.HealthCheck.Path,
+		cfg.HealthCheck.Interval,
+		cfg.HealthCheck.Timeout,
+	)
 	go newHealthChecker.Start(healthCtx)
 
-	// 4. Atomically store the new balancer
-	proxyHandler.CurrentBalancer.Store(newBalancer)
-	log.Printf("Config reloaded successfully: %d backends active\n", len(newBackends))
+	// 5. Atomically swap the balancer
+	proxyHandler.SetBalancer(newBalancer)
+	logger.Info("Config reloaded successfully",
+		slog.String("strategy", cfg.Strategy),
+		slog.Int("active_backends", len(newBackends)),
+	)
 	return nil
 }

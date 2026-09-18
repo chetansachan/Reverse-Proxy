@@ -2,69 +2,130 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"high-performance-proxy/internal/backend"
-	"log"
+	"high-performance-proxy/pkg/logger"
+	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
+// HealthChecker actively monitors the health of registered upstream backends concurrently.
 type HealthChecker struct {
 	Backends []*backend.Backend
 	client   *http.Client
+	path     string
+	interval time.Duration
+	timeout  time.Duration
 }
 
-func NewHealthChecker(backends []*backend.Backend) *HealthChecker {
+// NewHealthChecker creates a HealthChecker with custom interval, timeout, and health check path.
+func NewHealthChecker(backends []*backend.Backend, path string, interval, timeout time.Duration) *HealthChecker {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if path == "" {
+		path = "/health"
+	}
+
 	return &HealthChecker{
 		Backends: backends,
+		path:     path,
+		interval: interval,
+		timeout:  timeout,
 		client: &http.Client{
-			Timeout: 2 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
 
+// Start begins periodic active health checking until the context is cancelled.
 func (h *HealthChecker) Start(ctx context.Context) {
-	h.checkAll(ctx)
+	logger.Info("Active health checker started",
+		slog.Int("backends", len(h.Backends)),
+		slog.Duration("interval", h.interval),
+		slog.Duration("timeout", h.timeout),
+		slog.String("path", h.path),
+	)
 
-	// 2. Create ticker once outside the loop
-	ticker := time.NewTicker(5 * time.Second)
+	// Perform immediate initial check
+	h.CheckAll(ctx)
+
+	ticker := time.NewTicker(h.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Health checker stopped")
+			logger.Info("Active health checker stopped")
 			return
 		case <-ticker.C:
-			h.checkAll(ctx)
+			h.CheckAll(ctx)
 		}
 	}
 }
 
-func (h *HealthChecker) checkAll(ctx context.Context) {
+// CheckAll checks all backends concurrently.
+func (h *HealthChecker) CheckAll(ctx context.Context) {
+	var wg sync.WaitGroup
+
 	for _, b := range h.Backends {
-		h.checkBackend(ctx, b)
+		wg.Add(1)
+		go func(target *backend.Backend) {
+			defer wg.Done()
+			h.CheckBackend(ctx, target)
+		}(b)
 	}
+
+	wg.Wait()
 }
 
-func (h *HealthChecker) checkBackend(ctx context.Context, b *backend.Backend) {
-	healthURL := b.URL.JoinPath("/health").String()
+// CheckBackend executes a health probe against a single backend and logs state changes.
+func (h *HealthChecker) CheckBackend(ctx context.Context, b *backend.Backend) {
+	healthURL := fmt.Sprintf("%s%s", b.URL.String(), h.path)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	probeCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		b.SetHealthy(false)
+		h.updateHealth(b, false, err.Error())
 		return
 	}
+	req.Header.Set("User-Agent", "HighPerformanceProxy-HealthCheck/1.0")
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		b.SetHealthy(false)
+		h.updateHealth(b, false, err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		b.SetHealthy(true)
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+		h.updateHealth(b, true, "")
 	} else {
-		b.SetHealthy(false)
+		h.updateHealth(b, false, fmt.Sprintf("HTTP %d", resp.StatusCode))
+	}
+}
+
+func (h *HealthChecker) updateHealth(b *backend.Backend, healthy bool, reason string) {
+	prev := b.IsHealthy()
+	b.SetHealthy(healthy)
+
+	if prev != healthy {
+		if healthy {
+			logger.Info("Backend recovered to healthy state",
+				slog.String("backend", b.URL.String()),
+			)
+		} else {
+			logger.Warn("Backend marked unhealthy",
+				slog.String("backend", b.URL.String()),
+				slog.String("reason", reason),
+			)
+		}
 	}
 }
